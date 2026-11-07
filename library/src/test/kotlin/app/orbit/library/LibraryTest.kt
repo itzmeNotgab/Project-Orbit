@@ -67,7 +67,11 @@ class LibraryTest {
         assertEquals("pet_cat", j.getJSONObject("pet").getString("id"))
     }
 
-    @Test fun catalogIdsUnique() = assertEquals(Catalog.cosmetics.size, Catalog.cosmetics.map { it.id }.toSet().size)
+    @Test fun catalogIdsUnique() {
+        assertEquals(Catalog.cosmetics.size, Catalog.cosmetics.map { it.id }.toSet().size)
+    }
 
-    @Test fun accountApiRejectsHttp() = assertThrows(IllegalArgumentException::class.java) { AccountApi("http://x.com").signIn("a", "b") }
+    @Test fun accountApiRejectsHttp() {
+        assertThrows(IllegalArgumentException::class.java) { AccountApi("http://x.com").signIn("a", "b") }
+    }
 }
