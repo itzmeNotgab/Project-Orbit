@@ -1,0 +1,33 @@
+apply plugin: 'com.android.library'
+
+group = 'expo.modules.orbitnative'
+version = '0.1.0'
+
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useExpoPublishing()
+
+if (project.ext.has('useDefaultAndroidSdkVersions')) {
+  useDefaultAndroidSdkVersions()
+} else {
+  android {
+    compileSdkVersion rootProject.ext.has('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
+    defaultConfig {
+      minSdkVersion rootProject.ext.has('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
+      targetSdkVersion rootProject.ext.has('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 35
+    }
+  }
+}
+
+android {
+  namespace "expo.modules.orbitnative"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
