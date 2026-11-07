@@ -35,7 +35,7 @@ fun RelayScreen() {
         Text("Relay", color = OrbitColors.Text, fontSize = 24.sp)
         OutlinedTextField(host, { host = it.trim() }, label = { Text("Server address") }, singleLine = true,
             enabled = !running, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(portText, { portText = it.filter(Char::isDigit).take(5) }, label = { Text("Port") },
+        OutlinedTextField(portText, { v: String -> portText = v.filter { c -> c.isDigit() }.take(5) }, label = { Text("Port") },
             singleLine = true, enabled = !running, modifier = Modifier.fillMaxWidth())
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
