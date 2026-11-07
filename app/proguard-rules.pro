@@ -1,0 +1,2 @@
+-keepclassmembers class app.orbit.client.ui.Bridge { @android.webkit.JavascriptInterface <methods>; }
+-dontwarn org.json.**
