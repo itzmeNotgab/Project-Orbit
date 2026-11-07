@@ -22,7 +22,7 @@ class RakNetTest {
         val b = RakNet.buildPong(1, 2, "abc")
         assertNull(RakNet.parsePong(b, 20))
         assertNull(RakNet.parsePong(b, b.size - 1))
-        b[20] = 0
+        b[18] = 0
         assertNull(RakNet.parsePong(b, b.size))
     }
 
