@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "ORBIT",
+    "slug": "orbit",
+    "version": "0.2.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0A0712",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.orbit.client"
+    }
+  }
+}

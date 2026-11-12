@@ -1,0 +1,30 @@
+name: Android build
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repo sanity check (stray copies, duplicate declarations, missing imports)
+        run: python3 tools/check_repo.py
+      - name: Renderer logic test (Node, mock canvas; not a device test)
+        run: node tools/viewer_test.js
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.9" }
+      - name: Unit tests
+        run: gradle --no-daemon :library:test
+      - name: Debug APK
+        run: gradle --no-daemon :app:assembleDebug
+      - uses: actions/upload-artifact@v4
+        with: { name: orbit-debug-apk, path: app/build/outputs/apk/debug/*.apk }
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test native core (host, sanitizers)
+        run: |
+          cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
+          cmake --build native/build
+          ctest --test-dir native/build --output-on-failure

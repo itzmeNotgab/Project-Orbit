@@ -1,0 +1,702 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"><style>html,body{margin:0;height:100%;background:transparent;overflow:hidden;touch-action:none}canvas{display:block;width:100%;height:100%;touch-action:none}</style></head><body><canvas id="c"></canvas><script>(function () {
+  'use strict';
+  if (window.__orbitViewerInit) return;
+  window.__orbitViewerInit = true;
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var DPR = Math.min(window.devicePixelRatio || 1, 2);
+  var W = 300, H = 300;
+  var LV = 6;
+  var LIGHT = [0.35, 0.85, 0.45];
+  (function () { var l = Math.sqrt(LIGHT[0] * LIGHT[0] + LIGHT[1] * LIGHT[1] + LIGHT[2] * LIGHT[2]); LIGHT = [LIGHT[0] / l, LIGHT[1] / l, LIGHT[2] / l]; })();
+
+  function post(m) {
+    try {
+      var s = JSON.stringify(m);
+      if (window.OrbitBridge && typeof window.OrbitBridge.post === 'function') window.OrbitBridge.post(s);
+      else if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(s);
+    } catch (e) {
+      // Never swallow bridge failures: the host sees console errors via WebChromeClient.
+      try { console.error('OrbitBridge.post failed: ' + e); } catch (_) {}
+    }
+  }
+  window.onerror = function (msg, src, line) {
+    try { console.error('viewer error: ' + msg + (line ? ' (line ' + line + ')' : '')); } catch (_) {}
+    post({ type: 'error', message: String(msg) });
+  };
+  window.addEventListener('unhandledrejection', function (e) { post({ type: 'error', message: 'unhandled promise rejection: ' + (e && e.reason) }); });
+
+  function resize() {
+    W = window.innerWidth || 300; H = window.innerHeight || 300;
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------- math ----------
+  function mul3(a, b) {
+    var r = new Array(9);
+    for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++)
+      r[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+    return r;
+  }
+  function rotX(a) { var c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, c, -s, 0, s, c]; }
+  function rotY(a) { var c = Math.cos(a), s = Math.sin(a); return [c, 0, s, 0, 1, 0, -s, 0, c]; }
+  function rotZ(a) { var c = Math.cos(a), s = Math.sin(a); return [c, -s, 0, s, c, 0, 0, 0, 1]; }
+  function rotMat(x, y, z) { return mul3(rotY(y), mul3(rotX(x), rotZ(z))); }
+  function app(m, p) {
+    return [m[0] * p[0] + m[1] * p[1] + m[2] * p[2], m[3] * p[0] + m[4] * p[1] + m[5] * p[2], m[6] * p[0] + m[7] * p[1] + m[8] * p[2]];
+  }
+  var I3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+
+  // ---------- colors ----------
+  var colorCache = {};
+  function hexToRgb(h) {
+    h = String(h || '#888888').replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    var n = parseInt(h, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function shadeHex(h, f) {
+    var c = hexToRgb(h);
+    return 'rgb(' + Math.round(c[0] * f) + ',' + Math.round(c[1] * f) + ',' + Math.round(c[2] * f) + ')';
+  }
+  function darker(h, f) { var c = hexToRgb(h); return '#' + [c[0], c[1], c[2]].map(function (v) { var x = Math.round(v * f); return (x < 16 ? '0' : '') + x.toString(16); }).join(''); }
+  function shadedColor(h, lv) {
+    var k = h + lv;
+    if (!colorCache[k]) colorCache[k] = shadeHex(h, 0.55 + 0.45 * lv / (LV - 1));
+    return colorCache[k];
+  }
+
+  // ---------- scene graph ----------
+  function Node(name, pos, rot) { return { name: name, pos: pos || [0, 0, 0], rot: rot || [0, 0, 0], boxes: [], kids: [], R: I3, t: [0, 0, 0] }; }
+  function nd(p, name, x, y, z, rx, ry, rz) { var n = Node(name, [x, y, z], [rx || 0, ry || 0, rz || 0]); p.kids.push(n); return n; }
+  function Box(w, h, d, off, o) {
+    o = o || {};
+    return { w: w, h: h, d: d, off: off || [0, 0, 0], tex: o.tex || null, uv: o.uv || [0, 0], color: o.color || '#888888',
+      infl: o.infl || 0, uvFaces: o.uvFaces || null, alpha: o.alpha == null ? 1 : o.alpha, mirror: !!o.mirror, flat: o.flat || null, frame: o.frame || false };
+  }
+  function bx(n, w, h, d, x, y, z, color, o) { o = o || {}; o.color = color; var b = Box(w, h, d, [x, y, z], o); n.boxes.push(b); return b; }
+  function updateXf(n, pR, pt) {
+    var lr = rotMat(n.rot[0], n.rot[1], n.rot[2]);
+    n.R = mul3(pR, lr);
+    var p = app(pR, n.pos);
+    n.t = [pt[0] + p[0], pt[1] + p[1], pt[2] + p[2]];
+    for (var i = 0; i < n.kids.length; i++) updateXf(n.kids[i], n.R, n.t);
+  }
+
+  // ---------- textures ----------
+  function makeCanvas(w, h) { var c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+  function makeTex(src) {
+    var w = src.naturalWidth || src.width, h = src.naturalHeight || src.height;
+    var base = makeCanvas(w, h), bc = base.getContext('2d');
+    bc.imageSmoothingEnabled = false; bc.drawImage(src, 0, 0);
+    var vs = [];
+    for (var i = 0; i < LV; i++) {
+      var sh = 0.55 + 0.45 * i / (LV - 1);
+      var c = makeCanvas(w, h), x = c.getContext('2d');
+      x.drawImage(base, 0, 0);
+      if (sh < 1) { x.globalCompositeOperation = 'source-atop'; x.fillStyle = 'rgba(0,0,0,' + (1 - sh) + ')'; x.fillRect(0, 0, w, h); }
+      vs.push(c);
+    }
+    return { w: w, h: h, scale: w / 64, v: vs };
+  }
+  function loadImg(src, cb) {
+    var im = new Image();
+    im.onload = function () { cb(im); };
+    im.onerror = function () { cb(null); };
+    im.src = src;
+  }
+
+  function uvRegion(face, w, h, d, u, v) {
+    switch (face) {
+      case 'top': return [u + d, v, w, d];
+      case 'bottom': return [u + d + w, v, w, d];
+      case 'right': return [u, v + d, d, h];
+      case 'front': return [u + d, v + d, w, h];
+      case 'left': return [u + d + w, v + d, d, h];
+      default: return [u + 2 * d + w, v + d, w, h];
+    }
+  }
+
+  function defaultSkinCanvas(accent) {
+    var c = makeCanvas(64, 64), g = c.getContext('2d');
+    var SK = '#d9a77c', HAIR = '#2f2147', SHIRT = accent, PANT = '#241c3a', SHOE = '#15111f';
+    function fr(x, y, w, h, col) { g.fillStyle = col; g.fillRect(x, y, w, h); }
+    // head 0,0 8x8x8
+    fr(0, 0, 32, 16, SK);
+    fr(8, 0, 8, 8, HAIR); fr(24, 8, 8, 8, HAIR);
+    fr(8, 8, 8, 2, HAIR); fr(0, 8, 8, 3, HAIR); fr(16, 8, 8, 3, HAIR);
+    fr(9, 12, 2, 2, '#1a1230'); fr(13, 12, 2, 2, '#1a1230'); fr(11, 14, 2, 1, '#a8543f');
+    // body 16,16 8x12x4
+    fr(16, 16, 24, 16, SHIRT);
+    fr(20, 16, 8, 4, darker(SHIRT, 0.8));
+    fr(22, 22, 4, 4, '#f4f0ff'); fr(21, 24, 6, 1, darker(SHIRT, 0.6));
+    // right arm 40,16
+    fr(40, 16, 16, 16, SHIRT); fr(40, 28, 16, 4, SK); fr(48, 16, 4, 4, SK);
+    // left arm 32,48
+    fr(32, 48, 16, 16, SHIRT); fr(32, 60, 16, 4, SK); fr(40, 48, 4, 4, SK);
+    // right leg 0,16
+    fr(0, 16, 16, 16, PANT); fr(0, 29, 16, 3, SHOE); fr(8, 16, 4, 4, SHOE);
+    // left leg 16,48
+    fr(16, 48, 16, 16, PANT); fr(16, 61, 16, 3, SHOE); fr(24, 48, 4, 4, SHOE);
+    return c;
+  }
+
+  var CAPE_PAL = {
+    orbit_nebula: ['#8B5CF6', '#2e1065'], orbit_ion: ['#22D3EE', '#083344'],
+    orbit_ember: ['#FB923C', '#431407'], orbit_aurora: ['#34D399', '#064e3b']
+  };
+  function capeCanvas(id) {
+    var pal = CAPE_PAL[id] || CAPE_PAL.orbit_nebula;
+    var c = makeCanvas(64, 32), g = c.getContext('2d');
+    g.fillStyle = darker(pal[1], 0.8); g.fillRect(0, 0, 64, 32);
+    var grad = g.createLinearGradient(0, 1, 0, 17); grad.addColorStop(0, pal[0]); grad.addColorStop(1, pal[1]);
+    g.fillStyle = grad; g.fillRect(1, 1, 10, 16);
+    g.fillStyle = pal[1]; g.fillRect(12, 1, 10, 16);
+    g.fillStyle = pal[0]; g.fillRect(1, 0, 10, 1);
+    // emblem: planet + ring
+    g.fillStyle = '#f4f0ff'; g.beginPath(); g.arc(6, 8, 2.6, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = '#f4f0ff'; g.lineWidth = 0.7; g.beginPath(); g.ellipse(6, 8, 4.4, 1.4, -0.45, 0, Math.PI * 2); g.stroke();
+    return c;
+  }
+  function sliceFrames(img) {
+    var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height, fh = w / 2;
+    var n = Math.max(1, Math.min(32, Math.round(h / fh)));
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      var c = makeCanvas(w, fh), x = c.getContext('2d'); x.imageSmoothingEnabled = false;
+      x.drawImage(img, 0, i * fh, w, fh, 0, 0, w, fh);
+      out.push(makeTex(c));
+    }
+    return out;
+  }
+
+  // ---------- state ----------
+  var state = {
+    skin: null, slim: false, anim: 'idle', camera: 'free', cosmetics: [],
+    cape: { enabled: false, id: 'orbit_nebula', tex: null, physics: true, stiffness: 0.5, sway: 0.6 },
+    pet: { id: null, distance: 22, visible: true }, accent: '#8B5CF6', spin: false
+  };
+  var skinKey = '__none__', capeKey = '__none__', structKey = '', defAccent = '';
+  var skinTex = null, capeTexs = null;
+  var parts = null, scene = null, upds = [], capeSegs = [], petNode = null, petUpd = null;
+
+  // ---------- camera ----------
+  var cam = { yaw: -0.5, pitch: 0.15, zoom: 1, ty: 16, gyaw: -0.5, gpitch: 0.15, gzoom: 1, gty: 16, useGoal: false };
+  var PRESETS = {
+    front: [0, 0.08, 1, 16], back: [Math.PI, 0.08, 1, 16], left: [Math.PI / 2, 0.08, 1, 16], right: [-Math.PI / 2, 0.08, 1, 16],
+    top: [-0.4, 1.35, 1, 16], close: [-0.35, 0.1, 2.3, 26]
+  };
+  function applyCamera(name) {
+    var p = PRESETS[name];
+    if (p) { cam.gyaw = p[0]; cam.gpitch = p[1]; cam.gzoom = p[2]; cam.gty = p[3]; cam.useGoal = true; }
+    else { cam.useGoal = false; }
+  }
+
+  // ---------- player ----------
+  var skinLegacy = false;
+  function buildPlayer(slim) {
+    var root = Node('player');
+    var aw = slim ? 3 : 4;
+    var ov = !skinLegacy;
+    var head = nd(root, 'head', 0, 24, 0);
+    head.boxes.push(Box(8, 8, 8, [0, 4, 0], { tex: 'skin', uv: [0, 0] }));
+    head.boxes.push(Box(8, 8, 8, [0, 4, 0], { tex: 'skin', uv: [32, 0], infl: 0.5 }));
+    var body = nd(root, 'body', 0, 18, 0);
+    body.boxes.push(Box(8, 12, 4, [0, 0, 0], { tex: 'skin', uv: [16, 16] }));
+    if (ov) body.boxes.push(Box(8, 12, 4, [0, 0, 0], { tex: 'skin', uv: [16, 32], infl: 0.5 }));
+    var rArm = nd(root, 'rArm', -(4 + aw / 2), 22, 0);
+    rArm.boxes.push(Box(aw, 12, 4, [0, -4, 0], { tex: 'skin', uv: [40, 16] }));
+    if (ov) rArm.boxes.push(Box(aw, 12, 4, [0, -4, 0], { tex: 'skin', uv: [40, 32], infl: 0.5 }));
+    var lArm = nd(root, 'lArm', 4 + aw / 2, 22, 0);
+    if (skinLegacy) lArm.boxes.push(Box(aw, 12, 4, [0, -4, 0], { tex: 'skin', uv: [40, 16], mirror: true }));
+    else {
+      lArm.boxes.push(Box(aw, 12, 4, [0, -4, 0], { tex: 'skin', uv: [32, 48] }));
+      lArm.boxes.push(Box(aw, 12, 4, [0, -4, 0], { tex: 'skin', uv: [48, 48], infl: 0.5 }));
+    }
+    var rLeg = nd(root, 'rLeg', -2, 12, 0);
+    rLeg.boxes.push(Box(4, 12, 4, [0, -6, 0], { tex: 'skin', uv: [0, 16] }));
+    if (ov) rLeg.boxes.push(Box(4, 12, 4, [0, -6, 0], { tex: 'skin', uv: [0, 32], infl: 0.5 }));
+    var lLeg = nd(root, 'lLeg', 2, 12, 0);
+    if (skinLegacy) lLeg.boxes.push(Box(4, 12, 4, [0, -6, 0], { tex: 'skin', uv: [0, 16], mirror: true }));
+    else {
+      lLeg.boxes.push(Box(4, 12, 4, [0, -6, 0], { tex: 'skin', uv: [16, 48] }));
+      lLeg.boxes.push(Box(4, 12, 4, [0, -6, 0], { tex: 'skin', uv: [0, 48], infl: 0.5 }));
+    }
+    return { root: root, head: head, body: body, rArm: rArm, lArm: lArm, rLeg: rLeg, lLeg: lLeg };
+  }
+
+  // ---------- cosmetics ----------
+  var GOLD = '#f2c94c';
+  function ringOf(parent, n, radius, w, h, d, color, o) {
+    for (var i = 0; i < n; i++) {
+      var a = i / n * Math.PI * 2;
+      var seg = nd(parent, 'seg', Math.cos(a) * radius, 0, Math.sin(a) * radius, 0, -a + Math.PI / 2, 0);
+      bx(seg, w, h, d, 0, 0, 0, color, o);
+    }
+  }
+  function wings(P, kind, A) {
+    var cols = { angel: ['#f4f4ff', 1], bat: ['#2a1f3d', 1], neon: [A, 0.8] }[kind];
+    [-1, 1].forEach(function (s) {
+      var w = nd(P.body, 'wing', s * 1.5, 3, -2.4, 0, s * 0.6, 0);
+      for (var i = 0; i < 5; i++) {
+        var len = kind === 'bat' ? 11 - i * 1.2 : 10 - i * 1.5;
+        var f = bx(w, len, 1.3, 0.5, s * (len / 2 + 0.4), 1 - i * 1.5, 0, cols[0], { alpha: cols[1] });
+        if (kind === 'bat' && i === 0) f.color = '#463a63';
+      }
+      if (kind === 'bat') bx(w, 12, 0.8, 0.8, s * 6, 2, 0, '#463a63');
+      upds.push(function (t) { w.rot[1] = s * (0.55 + 0.35 * Math.sin(t * 3)); w.rot[2] = s * 0.08 * Math.sin(t * 3); });
+    });
+  }
+  function tail(P, kind, A) {
+    var cols = { fox: ['#e8772e', '#f4f0e6'], dragon: ['#2f9e6f', '#1d6b4a'], cat: ['#2b2b33', '#2b2b33'] }[kind];
+    var segs = kind === 'cat' ? 6 : 5;
+    var parent = nd(P.body, 'tail', 0, -5, -2);
+    var nodes = [];
+    for (var i = 0; i < segs; i++) {
+      var thick = kind === 'dragon' ? 3.4 - i * 0.55 : kind === 'cat' ? 1.8 : 3 - i * 0.2;
+      var len = 3;
+      var n = nd(parent, 'ts', 0, 0, i === 0 ? 0 : -len, kind === 'cat' ? 0.3 : 0.18, 0, 0);
+      var col = (kind === 'fox' && i >= segs - 2) ? cols[1] : cols[0];
+      bx(n, thick, thick, len + 0.2, 0, 0, -len / 2, col);
+      if (kind === 'dragon') bx(n, 0.9, 1.4, 1, 0, thick / 2 + 0.5, -len / 2, cols[1]);
+      nodes.push(n); parent = n;
+    }
+    upds.push(function (t, sp) {
+      for (var i = 0; i < nodes.length; i++) nodes[i].rot[1] = Math.sin(t * (2 + sp) - i * 0.6) * (0.16 + 0.05 * sp);
+    });
+  }
+  var COSM = {
+    hat_tophat: function (P, A) {
+      bx(P.head, 12, 1, 12, 0, 8.5, 0, '#1b1b22'); bx(P.head, 8, 7, 8, 0, 12.5, 0, '#23232e'); bx(P.head, 8.2, 1.6, 8.2, 0, 9.8, 0, A);
+    },
+    hat_crown: function (P) {
+      bx(P.head, 9, 2, 9, 0, 9, 0, GOLD);
+      [[-3.5, -3.5], [3.5, -3.5], [-3.5, 3.5], [3.5, 3.5], [0, 0]].forEach(function (p) { bx(P.head, 2, 3, 2, p[0], 11.5, p[1], GOLD); });
+      bx(P.head, 1.4, 1.4, 0.6, 0, 9, 4.6, '#d6336c');
+    },
+    hat_wizard: function (P, A) {
+      var c = '#3b1f7a';
+      bx(P.head, 12, 1, 12, 0, 8.5, 0, c); bx(P.head, 8, 3, 8, 0, 10.5, 0, c); bx(P.head, 6, 3, 6, 0, 13.5, 0, c);
+      bx(P.head, 4, 3, 4, 0.6, 16.5, 0, c); bx(P.head, 2, 3, 2, 1.4, 19.5, 0, c); bx(P.head, 8.2, 1, 8.2, 0, 9.5, 0, A);
+    },
+    halo_ring: function (P) {
+      var h = nd(P.head, 'halo', 0, 12.5, 0);
+      ringOf(h, 8, 5.5, 3.4, 0.8, 1.2, '#ffe27a');
+      upds.push(function (t) { h.pos[1] = 12.5 + Math.sin(t * 2) * 0.5; h.rot[1] = t * 0.8; });
+    },
+    halo_neon: function (P, A) {
+      var h = nd(P.head, 'halo', 0, 13, 0, 0.3, 0, 0);
+      ringOf(h, 10, 6, 3.4, 0.7, 1, A, { alpha: 0.9 });
+      upds.push(function (t) { h.rot[1] = t * 1.6; h.rot[0] = 0.3 + Math.sin(t) * 0.1; });
+    },
+    head_headphones: function (P, A) {
+      bx(P.head, 2, 5, 5, -5, 4, 0, '#2b2b3a'); bx(P.head, 2, 5, 5, 5, 4, 0, '#2b2b3a');
+      bx(P.head, 0.6, 3, 3, -6.1, 4, 0, A); bx(P.head, 0.6, 3, 3, 6.1, 4, 0, A);
+      bx(P.head, 1.2, 4.5, 1.8, -4.4, 8, 0, '#2b2b3a'); bx(P.head, 1.2, 4.5, 1.8, 4.4, 8, 0, '#2b2b3a'); bx(P.head, 9.6, 1.2, 1.8, 0, 9.4, 0, '#2b2b3a');
+    },
+    head_antennae: function (P, A) {
+      [-1, 1].forEach(function (s) {
+        var a = nd(P.head, 'ant', s * 2.5, 8, 0);
+        bx(a, 0.8, 5, 0.8, 0, 2.5, 0, '#8c8fa0'); bx(a, 2, 2, 2, 0, 6, 0, A);
+        upds.push(function (t) { a.rot[2] = s * -0.25 + Math.sin(t * 3 + s) * 0.12; });
+      });
+    },
+    head_visor: function (P) {
+      bx(P.head, 9.4, 2.8, 0.8, 0, 4.5, 4.4, '#10d0ff', { alpha: 0.75 });
+      bx(P.head, 0.8, 2.8, 8.6, -4.6, 4.5, 0, '#10d0ff', { alpha: 0.75 }); bx(P.head, 0.8, 2.8, 8.6, 4.6, 4.5, 0, '#10d0ff', { alpha: 0.75 });
+      bx(P.head, 9.8, 0.6, 0.9, 0, 6, 4.5, '#2b2b3a');
+    },
+    wings_angel: function (P, A) { wings(P, 'angel', A); },
+    wings_bat: function (P, A) { wings(P, 'bat', A); },
+    wings_neon: function (P, A) { wings(P, 'neon', A); },
+    tail_fox: function (P, A) { tail(P, 'fox', A); },
+    tail_dragon: function (P, A) { tail(P, 'dragon', A); },
+    tail_cat: function (P, A) { tail(P, 'cat', A); },
+    back_backpack: function (P) {
+      bx(P.body, 7, 9, 3.5, 0, 0.5, -3.8, '#6b4a2e'); bx(P.body, 7.2, 3, 3.8, 0, 4, -3.8, '#8a6240'); bx(P.body, 2, 2, 0.6, 0, 1, -5.7, GOLD);
+    },
+    back_jetpack: function (P) {
+      [-1, 1].forEach(function (s) {
+        bx(P.body, 2.8, 9, 2.8, s * 2.2, 0.5, -3.5, '#8c8fa0'); bx(P.body, 2, 1.5, 2, s * 2.2, -4.7, -3.5, '#333344');
+        var fl = bx(P.body, 1.4, 3, 1.4, s * 2.2, -7, -3.5, '#ffb347', { alpha: 0.85 });
+        upds.push(function (t) { fl.h = 2.5 + Math.sin(t * 30 + s) * 1.2; fl.off[1] = -5.5 - fl.h / 2; });
+      });
+      bx(P.body, 3, 1, 1, 0, 2, -3.5, '#555566');
+    },
+    back_sword: function (P) {
+      var n = nd(P.body, 'sword', 0, 0, -2.8, 0, 0, 0.75);
+      bx(n, 1, 11, 0.8, 0, 2, 0, '#cfd8e8'); bx(n, 4, 1, 1.2, 0, -3.8, 0, GOLD); bx(n, 1, 3, 1, 0, -5.6, 0, '#5a3a1e');
+    },
+    shoulder_pads: function (P, A) {
+      [P.rArm, P.lArm].forEach(function (a) { bx(a, 5.4, 1.6, 5.4, 0, 2.7, 0, A); bx(a, 5.8, 0.8, 5.8, 0, 1.9, 0, darker(A, 0.6)); });
+    },
+    shoulder_spikes: function (P) {
+      [P.rArm, P.lArm].forEach(function (a) { bx(a, 4.6, 1, 4.6, 0, 2.5, 0, '#2b2b3a'); bx(a, 1.2, 3, 1.2, 0, 4.5, 0, '#cfd8e8'); bx(a, 1, 2, 1, 1.4, 3.8, 1.2, '#cfd8e8'); bx(a, 1, 2, 1, -1.4, 3.8, -1.2, '#cfd8e8'); });
+    },
+    shoulder_parrot: function (P) {
+      var p = nd(P.lArm, 'parrot', 0, 2, 0);
+      bx(p, 2.6, 3, 2.6, 0, 1.5, 0, '#d83a3a'); bx(p, 2, 2, 2, 0, 3.8, 0.3, '#e24d4d'); bx(p, 0.8, 0.8, 1, 0, 3.6, 1.6, '#f5c242');
+      bx(p, 0.6, 2, 1.2, 0, 0.5, -1.8, '#2f6fd8'); bx(p, 0.5, 1.8, 2, 1.5, 1.5, 0, '#2f6fd8'); bx(p, 0.5, 1.8, 2, -1.5, 1.5, 0, '#2f6fd8');
+      upds.push(function (t) { p.rot[2] = Math.sin(t * 2) * 0.08; p.pos[1] = 2 + Math.max(0, Math.sin(t * 6)) * 0.2; });
+    },
+    other_scarf: function (P, A) {
+      bx(P.body, 8.8, 2, 4.8, 0, 5.2, 0, A); bx(P.head, 8.4, 1.4, 4.4, 0, -0.2, 0, A);
+      var s = nd(P.body, 'scarf', 2.5, 4.5, 2.6);
+      bx(s, 2, 8, 0.9, 0, -4, 0, A); bx(s, 2, 1, 1, 0, -8.2, 0, darker(A, 0.7));
+      upds.push(function (t, sp) { s.rot[0] = -0.05 - 0.2 * sp + Math.sin(t * 3) * 0.05; });
+    },
+    other_orbit_ring: function (P, A) {
+      var o = nd(P.root, 'orbit', 0, 16, 0);
+      var cols = [A, '#f4f0ff', '#22D3EE'];
+      for (var i = 0; i < 3; i++) {
+        var arm = nd(o, 'arm', 0, (i - 1) * 6, 0, 0, i * 2.09, 0);
+        bx(arm, 2.2, 2.2, 2.2, 11, 0, 0, cols[i]);
+      }
+      upds.push(function (t) { o.rot[1] = t * 1.1; });
+    },
+    other_belt: function (P) {
+      bx(P.body, 8.4, 1.8, 4.4, 0, -4.2, 0, '#2b2b3a'); bx(P.body, 2.2, 1.8, 0.5, 0, -4.2, 2.3, GOLD);
+    }
+  };
+
+  // ---------- pets ----------
+  var PETS = {
+    pet_cat: function (root) {
+      var b = nd(root, 'pbody', 0, 4.5, 0); bx(b, 4, 3.2, 7.5, 0, 0, 0, '#d8d2e8');
+      var h = nd(b, 'phead', 0, 1.2, 4.8); bx(h, 4, 3.6, 3.6, 0, 0.4, 0, '#d8d2e8'); bx(h, 1, 1.4, 0.8, -1.3, 2.6, 0, '#d8d2e8'); bx(h, 1, 1.4, 0.8, 1.3, 2.6, 0, '#d8d2e8');
+      bx(h, 0.7, 0.7, 0.3, -1, 0.6, 1.85, '#1a1230'); bx(h, 0.7, 0.7, 0.3, 1, 0.6, 1.85, '#1a1230');
+      var legs = [[-1.4, 3.1], [1.4, 3.1], [-1.4, -3.1], [1.4, -3.1]].map(function (p, i) {
+        var l = nd(b, 'leg', p[0], -1.3, p[1]); bx(l, 1.3, 3.2, 1.3, 0, -1.6, 0, '#bdb5d6'); return l;
+      });
+      var t = nd(b, 'ptail', 0, 0.8, -3.6, 0.9, 0, 0); bx(t, 1, 1, 4.5, 0, 0, -2.2, '#d8d2e8');
+      return function (tm, sp) {
+        var s = Math.sin(tm * (sp > 1.4 ? 10 : 6)) * 0.7 * Math.min(1, sp);
+        legs[0].rot[0] = s; legs[3].rot[0] = s; legs[1].rot[0] = -s; legs[2].rot[0] = -s;
+        t.rot[1] = Math.sin(tm * 3) * 0.4; b.pos[1] = 4.5 + Math.abs(s) * 0.3; h.rot[1] = Math.sin(tm * 1.3) * 0.2;
+      };
+    },
+    pet_slime: function (root) {
+      var b = nd(root, 'slime', 0, 0, 0);
+      var core = bx(b, 3, 3, 3, 0, 4, 0, '#1f7a4d');
+      var shell = bx(b, 7, 6, 7, 0, 4, 0, '#59e08f', { alpha: 0.6 });
+      bx(b, 1.2, 1.2, 0.4, -1.6, 4.6, 3.55, '#0c3b24'); bx(b, 1.2, 1.2, 0.4, 1.6, 4.6, 3.55, '#0c3b24');
+      return function (tm, sp) {
+        var k = Math.abs(Math.sin(tm * (2 + sp * 2)));
+        shell.h = 6 - k * 1.6 + 0.2; shell.w = shell.d = 7 + k * 1.2; shell.off[1] = shell.h / 2; core.off[1] = 3.2 + k * 0.6;
+        b.pos[1] = k * (sp > 0 ? 3 : 0.4);
+      };
+    },
+    pet_robot: function (root) {
+      var b = nd(root, 'bot', 0, 6, 0);
+      bx(b, 5, 4, 5, 0, 0, 0, '#8c8fa0'); bx(b, 3.4, 3, 3.4, 0, 3.6, 0, '#aab0c4'); bx(b, 2.4, 0.8, 0.4, 0, 3.8, 1.8, '#22D3EE');
+      bx(b, 0.5, 2, 0.5, 0, 6.4, 0, '#555566'); var tip = bx(b, 1.2, 1.2, 1.2, 0, 7.8, 0, '#ff5d73');
+      bx(b, 1.4, 1.4, 1.4, -3.2, -0.5, 0, '#555566'); bx(b, 1.4, 1.4, 1.4, 3.2, -0.5, 0, '#555566');
+      var thr = bx(b, 2.6, 1, 2.6, 0, -2.6, 0, '#22D3EE', { alpha: 0.7 });
+      return function (tm, sp) {
+        b.pos[1] = 6 + Math.sin(tm * 3) * 0.8; b.rot[1] = Math.sin(tm * 1.2) * 0.25;
+        thr.w = thr.d = 2.2 + Math.sin(tm * 14) * 0.5; tip.color = Math.sin(tm * 5) > 0 ? '#ff5d73' : '#7a2a38';
+      };
+    },
+    pet_dragonling: function (root) {
+      var b = nd(root, 'drag', 0, 4.5, 0); bx(b, 4, 3.6, 7, 0, 0, 0, '#7c5cff');
+      var h = nd(b, 'dhead', 0, 1.4, 4.6); bx(h, 3.8, 3.4, 3.6, 0, 0.3, 0, '#8d70ff'); bx(h, 2.4, 1.6, 1.8, 0, -0.4, 2.4, '#8d70ff');
+      bx(h, 0.8, 1.6, 0.8, -1.2, 2.6, -0.6, '#f2c94c'); bx(h, 0.8, 1.6, 0.8, 1.2, 2.6, -0.6, '#f2c94c');
+      bx(h, 0.7, 0.7, 0.3, -1, 0.8, 1.85, '#fff'); bx(h, 0.7, 0.7, 0.3, 1, 0.8, 1.85, '#fff');
+      var legs = [[-1.6, 2.6], [1.6, 2.6], [-1.6, -2.6], [1.6, -2.6]].map(function (p) { var l = nd(b, 'leg', p[0], -1.5, p[1]); bx(l, 1.4, 3, 1.4, 0, -1.5, 0, '#5b3fd6'); return l; });
+      var wl = nd(b, 'wl', -2, 1.6, -0.5, 0, 0, 0), wr = nd(b, 'wr', 2, 1.6, -0.5, 0, 0, 0);
+      bx(wl, 4, 0.5, 4, -2, 0, 0, '#a590ff', { alpha: 0.9 }); bx(wr, 4, 0.5, 4, 2, 0, 0, '#a590ff', { alpha: 0.9 });
+      var tl = nd(b, 'dt', 0, 0.2, -3.5, 0.2, 0, 0); bx(tl, 1.8, 1.8, 4, 0, 0, -2, '#7c5cff');
+      return function (tm, sp) {
+        var s = Math.sin(tm * (sp > 1.4 ? 10 : 6)) * 0.7 * Math.min(1, sp);
+        legs[0].rot[0] = s; legs[3].rot[0] = s; legs[1].rot[0] = -s; legs[2].rot[0] = -s;
+        wl.rot[2] = 0.3 + Math.sin(tm * 8) * 0.5; wr.rot[2] = -wl.rot[2]; tl.rot[1] = Math.sin(tm * 3) * 0.3;
+        b.pos[1] = 4.5 + Math.abs(s) * 0.3;
+      };
+    }
+  };
+
+  // ---------- cape ----------
+  function buildCape(P) {
+    capeSegs = [];
+    var parent = nd(P.body, 'caperoot', 0, 6, -2.6);
+    for (var i = 0; i < 4; i++) {
+      var n = nd(parent, 'cs' + i, 0, i === 0 ? 0 : -4, 0);
+      var b = Box(10, 4, 1, [0, -2, 0], { tex: 'cape', uv: [0, 0], frame: true });
+      b.uvFaces = {
+        back: [1, 1 + 4 * i, 10, 4], front: [12, 1 + 4 * i, 10, 4], right: [0, 1 + 4 * i, 1, 4], left: [11, 1 + 4 * i, 1, 4],
+        top: [1, 0, 10, 1], bottom: [11, 0, 10, 1]
+      };
+      n.boxes.push(b);
+      capeSegs.push({ node: n, a: 0.1, v: 0 });
+      parent = n;
+    }
+  }
+  var speed = 0;
+  function simCape(t, dt) {
+    var c = state.cape;
+    var base = 0.08 + 0.1 * speed;
+    for (var i = 0; i < capeSegs.length; i++) {
+      var s = capeSegs[i];
+      var rest = i === 0 ? base * 1.4 : base * 0.45;
+      if (!c.physics) { s.a = rest; s.v = 0; }
+      else {
+        var k = 18 + c.stiffness * 70, damp = 2.4 + c.stiffness * 2.5;
+        var drive = (0.35 + 0.9 * speed) * c.sway * (i + 1) * 0.5 * Math.sin(t * (2.2 + speed * 2.5) - i * 0.9) + 0.08 * c.sway * Math.sin(t * 1.3 + i);
+        var acc = -k * (s.a - rest) - damp * s.v + drive * 30 * (1 - c.stiffness * 0.5);
+        s.v += acc * dt; s.a += s.v * dt;
+        s.a = clamp(s.a, -0.25, 1.2);
+      }
+      s.node.rot[0] = s.a;
+    }
+  }
+
+  // ---------- build ----------
+  function rebuild() {
+    upds = []; capeSegs = []; petNode = null; petUpd = null;
+    var A = state.accent;
+    scene = Node('scene');
+    parts = buildPlayer(state.slim);
+    scene.kids.push(parts.root);
+    var P = parts;
+    state.cosmetics.forEach(function (id) { if (COSM[id]) COSM[id](P, A); });
+    if (state.cape.enabled) buildCape(P);
+    if (state.pet.id && state.pet.visible && PETS[state.pet.id]) {
+      petNode = nd(scene, 'pet', state.pet.distance, 0, 0);
+      petUpd = PETS[state.pet.id](petNode);
+    }
+  }
+
+  var t = 0;
+  function pose(dt) {
+    var P = parts;
+    P.rLeg.rot[0] = P.lLeg.rot[0] = P.rArm.rot[0] = P.lArm.rot[0] = 0;
+    P.rArm.rot[2] = 0.04; P.lArm.rot[2] = -0.04; P.body.rot[0] = 0; P.head.rot[0] = P.head.rot[1] = 0; P.root.pos[1] = 0;
+    var a = state.anim, target = 0, amp = 0, rate = 0;
+    if (a === 'walk') { target = 1; amp = 0.7; rate = 6; } else if (a === 'run') { target = 1.8; amp = 1.1; rate = 10; }
+    speed += (target - speed) * Math.min(1, dt * 5);
+    if (target > 0) {
+      var sw = Math.sin(t * rate);
+      P.rLeg.rot[0] = sw * amp; P.lLeg.rot[0] = -sw * amp; P.rArm.rot[0] = -sw * amp * 0.9; P.lArm.rot[0] = sw * amp * 0.9;
+      P.root.pos[1] = Math.abs(sw) * (a === 'run' ? 1 : 0.5);
+      if (a === 'run') P.body.rot[0] = 0.15;
+    } else {
+      P.rArm.rot[2] = 0.05 + 0.03 * Math.sin(t * 2); P.lArm.rot[2] = -0.05 - 0.03 * Math.sin(t * 2);
+      P.head.rot[1] = Math.sin(t * 0.8) * 0.12; P.head.rot[0] = Math.sin(t * 1.1) * 0.03;
+    }
+    if (a === 'wave') { P.rArm.rot[2] = -(2.6 + 0.3 * Math.sin(t * 8)); P.rArm.rot[0] = 0; }
+    for (var i = 0; i < upds.length; i++) upds[i](t, speed);
+    if (capeSegs.length) simCape(t, dt);
+    if (petUpd) { petNode.pos[0] = state.pet.distance; petUpd(t, speed); }
+  }
+
+  // ---------- render ----------
+  var faceList = [];
+  var FACES = ['front', 'back', 'right', 'left', 'top', 'bottom'];
+  function faceDef(face, hx, hy, hz) {
+    switch (face) {
+      case 'front': return { n: [0, 0, 1], tl: [-hx, hy, hz], u: [1, 0, 0], v: [0, -1, 0], uw: 2 * hx, vh: 2 * hy };
+      case 'back': return { n: [0, 0, -1], tl: [hx, hy, -hz], u: [-1, 0, 0], v: [0, -1, 0], uw: 2 * hx, vh: 2 * hy };
+      case 'right': return { n: [-1, 0, 0], tl: [-hx, hy, -hz], u: [0, 0, 1], v: [0, -1, 0], uw: 2 * hz, vh: 2 * hy };
+      case 'left': return { n: [1, 0, 0], tl: [hx, hy, hz], u: [0, 0, -1], v: [0, -1, 0], uw: 2 * hz, vh: 2 * hy };
+      case 'top': return { n: [0, 1, 0], tl: [-hx, hy, -hz], u: [1, 0, 0], v: [0, 0, 1], uw: 2 * hx, vh: 2 * hz };
+      default: return { n: [0, -1, 0], tl: [-hx, -hy, hz], u: [1, 0, 0], v: [0, 0, -1], uw: 2 * hx, vh: 2 * hz };
+    }
+  }
+  var VR = I3, S = 6;
+  function collect(n) {
+    for (var bi = 0; bi < n.boxes.length; bi++) {
+      var b = n.boxes[bi];
+      var tex = null, fr = 0;
+      if (b.tex === 'skin') tex = skinTex;
+      else if (b.tex === 'cape' && capeTexs) { tex = capeTexs[Math.floor(t * 8) % capeTexs.length]; }
+      if (b.tex && !tex) continue;
+      var hx = b.w / 2 + b.infl, hy = b.h / 2 + b.infl, hz = b.d / 2 + b.infl;
+      for (var fi = 0; fi < 6; fi++) {
+        var face = FACES[fi];
+        var fd = faceDef(face, hx, hy, hz);
+        var wn = app(n.R, fd.n);
+        var vn = app(VR, wn);
+        if (vn[2] <= 0.001) continue;
+        var tlL = [b.off[0] + fd.tl[0], b.off[1] + fd.tl[1], b.off[2] + fd.tl[2]];
+        var tlW = app(n.R, tlL);
+        tlW = [tlW[0] + n.t[0], tlW[1] + n.t[1] - cam.ty, tlW[2] + n.t[2]];
+        var vTL = app(VR, tlW);
+        var uW = app(n.R, [fd.u[0] * fd.uw, fd.u[1] * fd.uw, fd.u[2] * fd.uw]);
+        var vW = app(n.R, [fd.v[0] * fd.vh, fd.v[1] * fd.vh, fd.v[2] * fd.vh]);
+        var vU = app(VR, uW), vV = app(VR, vW);
+        var dotl = wn[0] * LIGHT[0] + wn[1] * LIGHT[1] + wn[2] * LIGHT[2];
+        var light = 0.55 + 0.45 * Math.max(0, dotl);
+        var lv = clamp(Math.round((light - 0.55) / 0.45 * (LV - 1)), 0, LV - 1);
+        var rec = {
+          z: vTL.length ? vTL[2] + 0.5 * vU[2] + 0.5 * vV[2] : 0,
+          x: W / 2 + vTL[0] * S, y: H * 0.56 - vTL[1] * S,
+          ux: vU[0] * S, uy: -vU[1] * S, vx: vV[0] * S, vy: -vV[1] * S,
+          lv: lv, color: b.color, alpha: b.alpha, tex: null, mirror: b.mirror
+        };
+        if (tex) {
+          var useFace = face;
+          if (b.mirror) useFace = face === 'right' ? 'left' : face === 'left' ? 'right' : face;
+          var reg = b.uvFaces ? b.uvFaces[useFace] : uvRegion(useFace, b.w, b.h, b.d, b.uv[0], b.uv[1]);
+          if (!reg) continue;
+          var sc = tex.scale;
+          rec.tex = tex; rec.sx = reg[0] * sc; rec.sy = reg[1] * sc; rec.sw = reg[2] * sc; rec.sh = reg[3] * sc;
+        }
+        faceList.push(rec);
+      }
+    }
+    for (var k = 0; k < n.kids.length; k++) collect(n.kids[k]);
+  }
+
+  function drawScene() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // accent glow
+    var gx = W / 2 * DPR, gy = H * 0.58 * DPR;
+    var g = ctx.createRadialGradient(gx, gy, 0, gx, gy, Math.min(W, H) * 0.55 * DPR);
+    var rgb = hexToRgb(state.accent);
+    g.addColorStop(0, 'rgba(' + rgb.join(',') + ',0.22)'); g.addColorStop(1, 'rgba(' + rgb.join(',') + ',0)');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    // ground shadow
+    var ground = app(VR, [0, -cam.ty, 0]);
+    var sx = W / 2 + ground[0] * S, sy = H * 0.56 - ground[1] * S;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(sx, sy, 9 * S, Math.max(2, 9 * S * Math.abs(Math.sin(cam.pitch))), 0, 0, Math.PI * 2); ctx.fill();
+
+    faceList.sort(function (a, b) { return a.z - b.z; });
+    ctx.imageSmoothingEnabled = false;
+    for (var i = 0; i < faceList.length; i++) {
+      var f = faceList[i];
+      ctx.globalAlpha = f.alpha;
+      if (f.tex) {
+        var px = f.x, py = f.y, ux = f.ux, uy = f.uy;
+        if (f.mirror) { px += ux; py += uy; ux = -ux; uy = -uy; }
+        ctx.setTransform(ux / f.sw * DPR, uy / f.sw * DPR, f.vx / f.sh * DPR, f.vy / f.sh * DPR, px * DPR, py * DPR);
+        ctx.drawImage(f.tex.v[f.lv], f.sx, f.sy, f.sw, f.sh, 0, 0, f.sw, f.sh);
+      } else {
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        var col = shadedColor(f.color, f.lv);
+        ctx.fillStyle = col; ctx.strokeStyle = col; ctx.lineWidth = 0.6;
+        ctx.beginPath();
+        ctx.moveTo(f.x, f.y); ctx.lineTo(f.x + f.ux, f.y + f.uy); ctx.lineTo(f.x + f.ux + f.vx, f.y + f.uy + f.vy); ctx.lineTo(f.x + f.vx, f.y + f.vy);
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+
+  var lastT = 0, lastDraw = 0;
+  var drawnPosted = false, lastErr = '';
+  function frame(now) {
+    window.requestAnimationFrame(frame);
+    if (!parts || !skinTex) return;
+    if (now - lastDraw < 30) return;
+    lastDraw = now;
+    try {
+    if ((window.innerWidth || 300) !== W || (window.innerHeight || 300) !== H) resize();
+    var dt = Math.min(0.05, (now - lastT) / 1000) || 0.016;
+    lastT = now;
+    t += dt;
+    if (state.spin && !dragging) cam.yaw += dt * 0.6;
+    if (cam.useGoal && !dragging) {
+      var k = Math.min(1, dt * 6);
+      var dy = cam.gyaw - cam.yaw;
+      while (dy > Math.PI) dy -= Math.PI * 2; while (dy < -Math.PI) dy += Math.PI * 2;
+      cam.yaw += dy * k; cam.pitch += (cam.gpitch - cam.pitch) * k; cam.zoom += (cam.gzoom - cam.zoom) * k; cam.ty += (cam.gty - cam.ty) * k;
+    }
+    S = cam.zoom * H / 46;
+    VR = mul3(rotX(cam.pitch), rotY(cam.yaw));
+    pose(dt);
+    updateXf(scene, I3, [0, 0, 0]);
+    faceList = [];
+    collect(scene);
+    drawScene();
+    if (!drawnPosted) { drawnPosted = true; post({ type: 'drawn', width: W, height: H, dpr: DPR }); }
+    } catch (e) {
+      var msg = String(e && e.message || e);
+      if (msg !== lastErr) { lastErr = msg; post({ type: 'error', message: 'frame: ' + msg }); }
+    }
+  }
+
+  // ---------- input ----------
+  var dragging = false, lx = 0, ly = 0, pinch = 0;
+  function tdist(e) { var a = e.touches[0], b = e.touches[1]; return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY); }
+  canvas.addEventListener('touchstart', function (e) {
+    e.preventDefault();
+    if (e.touches.length === 1) { dragging = true; cam.useGoal = false; lx = e.touches[0].clientX; ly = e.touches[0].clientY; }
+    else if (e.touches.length === 2) { pinch = tdist(e); dragging = false; cam.useGoal = false; }
+  }, { passive: false });
+  canvas.addEventListener('touchmove', function (e) {
+    e.preventDefault();
+    if (e.touches.length === 1 && dragging) {
+      var x = e.touches[0].clientX, y = e.touches[0].clientY;
+      cam.yaw += (x - lx) * 0.012; cam.pitch = clamp(cam.pitch + (y - ly) * 0.008, -1.4, 1.4); lx = x; ly = y;
+    } else if (e.touches.length === 2 && pinch) {
+      var d = tdist(e); cam.zoom = clamp(cam.zoom * (d / pinch), 0.6, 3.4); pinch = d;
+    }
+  }, { passive: false });
+  canvas.addEventListener('touchend', function (e) { dragging = false; if (e.touches.length < 2) pinch = 0; if (e.touches.length === 1) { dragging = true; lx = e.touches[0].clientX; ly = e.touches[0].clientY; } });
+  canvas.addEventListener('mousedown', function (e) { dragging = true; cam.useGoal = false; lx = e.clientX; ly = e.clientY; });
+  window.addEventListener('mouseup', function () { dragging = false; });
+  window.addEventListener('mousemove', function (e) { if (!dragging) return; cam.yaw += (e.clientX - lx) * 0.012; cam.pitch = clamp(cam.pitch + (e.clientY - ly) * 0.008, -1.4, 1.4); lx = e.clientX; ly = e.clientY; });
+  canvas.addEventListener('wheel', function (e) { e.preventDefault(); cam.zoom = clamp(cam.zoom * (e.deltaY < 0 ? 1.08 : 0.92), 0.6, 3.4); }, { passive: false });
+
+  // ---------- state application ----------
+  function normalize(s) {
+    var d = {
+      skin: s.skin || null, slim: !!s.slim, anim: s.anim || 'idle', camera: s.camera || 'free',
+      cosmetics: Array.isArray(s.cosmetics) ? s.cosmetics.slice() : [], accent: s.accent || '#8B5CF6', spin: !!s.spin,
+      cape: Object.assign({ enabled: false, id: 'orbit_nebula', tex: null, physics: true, stiffness: 0.5, sway: 0.6 }, s.cape || {}),
+      pet: Object.assign({ id: null, distance: 22, visible: true }, s.pet || {})
+    };
+    return d;
+  }
+
+  var applySeq = 0;
+  window.orbitSet = function (s) {
+    try {
+      var prevCam = state.camera;
+      state = normalize(s);
+      if (state.camera !== prevCam) applyCamera(state.camera);
+      var seq = ++applySeq;
+      var needSkin = (state.skin || '') !== skinKey || (!state.skin && defAccent !== state.accent);
+      var needCape = state.cape.enabled && (state.cape.tex ? 'u:' + state.cape.tex.length + state.cape.tex.slice(-30) : 'b:' + state.cape.id + state.accent) !== capeKey;
+      var pending = 0;
+      function done() { if (--pending <= 0 && seq === applySeq) finish(); }
+      if (needSkin) {
+        pending++;
+        skinKey = state.skin || '';
+        if (state.skin) {
+          loadImg(state.skin, function (im) {
+            var src = im || defaultSkinCanvas(state.accent);
+            skinTex = makeTex(src); skinLegacy = skinTex.h * 2 === skinTex.w; structKey = ''; done();
+          });
+        } else { defAccent = state.accent; skinTex = makeTex(defaultSkinCanvas(state.accent)); skinLegacy = false; structKey = ''; setTimeout(done, 0); }
+      }
+      if (needCape) {
+        pending++;
+        if (state.cape.tex) {
+          capeKey = 'u:' + state.cape.tex.length + state.cape.tex.slice(-30);
+          loadImg(state.cape.tex, function (im) { capeTexs = im ? sliceFrames(im) : [makeTex(capeCanvas('orbit_nebula'))]; structKey = ''; done(); });
+        } else {
+          capeKey = 'b:' + state.cape.id + state.accent;
+          capeTexs = [makeTex(capeCanvas(state.cape.id))]; structKey = ''; setTimeout(done, 0);
+        }
+      }
+      if (pending === 0) finish();
+    } catch (e) { post({ type: 'error', message: String(e && e.message || e) }); }
+  };
+  function finish() {
+    var key = JSON.stringify([state.slim, state.cosmetics, state.cape.enabled, state.pet.id, state.pet.visible, state.accent, skinKey.length, capeKey]);
+    if (key !== structKey || !parts) { structKey = key; rebuild(); }
+  }
+
+  post({ type: 'ready' });
+  window.requestAnimationFrame(frame);
+})();
+</script></body></html>

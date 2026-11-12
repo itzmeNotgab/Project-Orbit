@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only folders ORBIT hands to Minecraft are shareable; account and settings files are not. -->
+<paths>
+    <files-path name="addons" path="addons/" />
+    <files-path name="textures" path="textures/" />
+    <files-path name="worlds" path="worlds/" />
+    <files-path name="export" path="export/" />
+</paths>

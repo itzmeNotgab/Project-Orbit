@@ -1,0 +1,32 @@
+{
+  "name": "orbit",
+  "version": "0.2.0",
+  "private": true,
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "typecheck": "tsc --noEmit",
+    "build:viewer": "node scripts/build-viewer.mjs"
+  },
+  "dependencies": {
+    "@react-native-async-storage/async-storage": "*",
+    "expo": "~57.0.0",
+    "expo-document-picker": "*",
+    "expo-file-system": "*",
+    "expo-intent-launcher": "*",
+    "expo-modules-core": "*",
+    "expo-secure-store": "*",
+    "expo-sharing": "*",
+    "expo-status-bar": "*",
+    "fflate": "^0.8.2",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "*",
+    "react-native-svg": "*",
+    "react-native-webview": "*"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.0",
+    "typescript": "~5.9.2"
+  }
+}
